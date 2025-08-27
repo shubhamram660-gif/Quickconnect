@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RandomChat Web — Omegle Style</title>
+<style>
+body { margin:0; font-family:Arial,sans-serif; background:#071029; color:#e6eef8; display:flex; flex-direction:column; align-items:center; padding:10px; }
+header { display:flex; justify-content:space-between; width:100%; max-width:900px; align-items:center; margin-bottom:10px; }
+h1 { margin:0; font-size:22px; }
+button { padding:8px 12px; border-radius:6px; border:none; cursor:pointer; }
+.primary { background:#0ea5e9; color:#012023; }
+.muted { background:#0b1220; color:#9fb0c9; border:1px solid #143044; }
+.danger { background:#ef4444; color:#fff; }
+video { width:100%; max-width:450px; border-radius:10px; background:#000; }
+.videos { display:flex; gap:10px; margin:10px 0; flex-wrap:wrap; justify-content:center; }
+.chat { width:100%; max-width:900px; height:180px; overflow:auto; background:#061326; padding:10px; border-radius:8px; border:1px solid #0f2b3f; }
+.row { display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+input, select { padding:8px; border-radius:6px; border:1px solid #123045; background:#071829; color:#e6eef8; flex:1; }
+.badge { font-size:12px; padding:5px 8px; border-radius:999px; background:#062334; }
+.small { font-size:13px; color:#9fb0c9; }
+</style>
+<!-- Firebase SDKs -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+</head>
+<body>
+
+<header>
+<h1>RandomChat • Omegle Style</h1>
+<div class="badge" id="status">Offline</div>
+</header>
+
+<div class="row">
+<input id="interests" placeholder="Interests (optional, comma separated)">
+<select id="genderPref">
+<option value="any">Anyone</option>
+<option value="male">Male only</option>
+<option value="female">Female only</option>
+</select>
+</div>
+
+<div class="row">
+<button id="startBtn" class="primary">Start</button>
+<button id="nextBtn" class="muted">Next</button>
+<button id="endBtn" class="danger">End</button>
+<div class="small" style="margin-left:auto">Online: <span id="onlineCount">0</span></div>
+</div>
+
+<div class="videos">
+<div>
+<div class="small">You</div>
+<video id="localVideo" autoplay muted playsinline></video>
+</div>
+<div>
+<div class="small">Partner</div>
+<video id="remoteVideo" autoplay playsinline></video>
+</div>
+</div>
+
+<div class="chat" id="chatBox"></div>
+<div class="row">
+<input id="msg" placeholder="Type message & Enter">
+<button id="sendBtn" class="primary">Send</button>
+</div>
+
+<div class="small" style="margin-top:10px">© <span id="year"></span> RandomChat — Firebase + WebRTC</div>
+
+<script>
+document.getElementById('year').textContent = new Date().getFullYear();
+
+/* ==== Firebase config ==== */
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_PROJECT.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+const app = firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+const auth = firebase.auth();
+
+let uid = null, pc = null, dataChannel = null, localStream = null, remoteStream = null, currentRoomRef = null, queuedDocRef = null;
+const servers = { iceServers:[{urls:['stun:stun.l.google.com:19302']}] };
+
+/* ===== UI ===== */
+const els = {
+  status: document.getElementById('status'),
+  startBtn: document.getElementById('startBtn'),
+  nextBtn: document.getElementById('nextBtn'),
+  endBtn: document.getElementById('endBtn'),
+  localVideo: document.getElementById('localVideo'),
+  remoteVideo: document.getElementById('remoteVideo'),
+  chatBox: document.getElementById('chatBox'),
+  msg: document.getElementById('msg'),
+  sendBtn: document.getElementById('sendBtn'),
+  interests: document.getElementById('interests'),
+  genderPref: document.getElementById('genderPref'),
+  onlineCount: document.getElementById('onlineCount')
+};
+
+function logSys(text){ const p=document.createElement('div'); p.className='small'; p.style.color='#94a3b8'; p.textContent=text; els.chatBox.appendChild(p); els.chatBox.scrollTop=els.chatBox.scrollHeight;}
+function logMe(text){ const p=document.createElement('div'); p.style.color='#cfe8ff'; p.textContent='You: '+text; els.chatBox.appendChild(p); els.chatBox.scrollTop=els.chatBox.scrollHeight;}
+function logThem(text){ const p=document.createElement('div'); p.style.color='#ffdf6b'; p.textContent='Stranger: '+text; els.chatBox.appendChild(p); els.chatBox.scrollTop=els.chatBox.scrollHeight;}
+
+/* ===== Init Firebase ===== */
+async function init(){
+  const userCredential = await auth.signInAnonymously();
+  uid = userCredential.user.uid;
+  els.status.textContent='Online';
+  const presenceRef = db.collection('presence').doc(uid);
+  await presenceRef.set({online:true, ts:firebase.firestore.FieldValue.serverTimestamp()});
+  window.addEventListener('beforeunload', ()=> presenceRef.delete() );
+  db.collection('presence').onSnapshot(snap => els.onlineCount.textContent = snap.docs.length);
+}
+init().catch(err=>alert('Firebase init error: '+err));
+
+/* ===== Media ===== */
+async function openMedia(){
+  if(localStream) return;
+  localStream = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+  els.localVideo.srcObject=localStream;
+}
+
+/* ===== Peer Connection ===== */
+function preparePeerConnection(isCaller){
+  pc=new RTCPeerConnection(servers);
+  remoteStream=new MediaStream();
+  els.remoteVideo.srcObject=remoteStream;
+  if(localStream) localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+  pc.ontrack=e=>{ e.streams[0].getTracks().forEach(t=>remoteStream.addTrack(t)); }
+  if(isCaller){
+    dataChannel = pc.createDataChannel('chat');
+    dataChannel.onmessage = e => logThem(e.data);
+    dataChannel.onopen = ()=> logSys('Data channel open');
+  } else {
+    pc.ondatachannel = e => {
+      dataChannel = e.channel;
+      dataChannel.onmessage = ev => logThem(ev.data);
+      dataChannel.onopen = ()=> logSys('Data channel open');
+    }
+  }
+}
+
+/* ===== Send Chat ===== */
+function sendMsg(){ 
+  const t=(els.msg.value||'').trim(); if(!t) return; logMe(t); 
+  if(dataChannel && dataChannel.readyState==='open') dataChannel.send(t); 
+  els.msg.value='';
+}
+els.sendBtn.onclick = sendMsg;
+els.msg.addEventListener('keydown', e=>{if(e.key==='Enter') sendMsg();});
+
+/* ===== Start / Next / End ===== */
+els.startBtn.onclick = start;
+els.nextBtn.onclick = skip;
+els.endBtn.onclick = endCall;
+
+async function start(){ 
+  await openMedia();
+  els.chatBox.innerHTML='';
+  // Join queue
+  const tags = (els.interests.value||'').toLowerCase().split(',').map(s=>s.trim()).filter(Boolean);
+  const genderPref = els.genderPref.value;
+  queuedDocRef = db.collection('queue').doc();
+  await queuedDocRef.set({uid,tags,gender:'any',pref:genderPref,ts:firebase.firestore.FieldValue.serverTimestamp()});
+  logSys('Waiting for partner...');
+  db.collection('queue').where('uid','!=',uid).onSnapshot(async snap=>{
+    if(currentRoomRef) return;
+    for(const d of snap.docs){
+      const data=d.data();
+      if(!data) continue;
+      try{ await db.collection('queue').doc(d.id).delete(); }catch(e){}
+      try{ await queuedDocRef.delete(); }catch(e){}
+      queuedDocRef=null;
+      await createRoomAsCaller(data.uid,tags);
+      break;
+    }
+  });
+}
+
+async function createRoomAsCaller(peerUid,tags){
+  const roomRef = db.collection('rooms').doc();
+  currentRoomRef=roomRef;
+  preparePeerConnection(true);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await roomRef.set({caller:uid,callee:peerUid,tags,offer:{type:offer.type,sdp:offer.sdp},ts:firebase.firestore.FieldValue.serverTimestamp()});
+  const callerCandidates = roomRef.collection('callerCandidates');
+  pc.onicecandidate = e => { if(e.candidate) callerCandidates.add(e.candidate.toJSON()); };
+  roomRef.onSnapshot(async snap => {
+    const data=snap.data();
+    if(data && data.answer && !pc.currentRemoteDescription){
+      await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+      logSys('Connected!');
+    }
+  });
+  roomRef.collection('calleeCandidates').onSnapshot(snap=>{
+    snap.docChanges().forEach(c=>{ if(c.type==='added') pc.addIceCandidate(new RTCIceCandidate(c.doc.data())).catch(()=>{}); });
+  });
+  logSys('Calling partner...');
+}
+
+async function skip(){ logSys('Skipping...'); await cleanupCurrentCall(true); setTimeout(()=>start(),300); }
+async function endCall(){ logSys('Call ended.'); await cleanupCurrentCall(false); }
+
+async function cleanupCurrentCall(dontNotify){
+  try{ if(queuedDocRef){ await queuedDocRef.delete(); queuedDocRef=null; } }catch(e){}
+  try{ if(currentRoomRef){ await currentRoomRef.delete(); currentRoomRef=null; } }catch(e){}
+  try{ if(pc){ pc.ontrack=null; pc.onicecandidate=null; pc.close(); } }catch(e){}
+  pc=null; dataChannel=null;
+  els.remoteVideo.srcObject=null;
+}
+
+</script>
+</body>
+</html>
